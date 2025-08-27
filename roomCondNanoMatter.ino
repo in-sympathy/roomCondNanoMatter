@@ -1,0 +1,647 @@
+/*
+  Nano Matter AQI - ENS160 + BME680 + DS18B20 (+ optional Matter Air Quality)
+
+  This version:
+  - One RED alert LED only: blink when ANY displayed value is out of its safe range.
+  - No color mixing; no heartbeat when OK (LED off).
+  - OLED screens, pairing layout, QR fit, and no-flicker pairing screen preserved.
+  - Matter publishes Temperature/Humidity/Pressure and optional Air Quality enum.
+  - BME680 gas is not used.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <math.h>
+
+// Sensors
+#include "ScioSense_ENS160.h"
+#include <Adafruit_BME680.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// Minimal QR (Nayuki)
+#include <qrcode.h>
+
+// Matter
+#include <Matter.h>
+
+// ------- Optional Matter wrappers (compile-time detected) -------
+#if !defined(__has_include)
+  #define __has_include(x) 0
+#endif
+
+#if __has_include(<MatterTemperature.h>)
+  #include <MatterTemperature.h>
+  #define HAS_MATTER_TEMP 1
+#endif
+#if __has_include(<MatterHumidity.h>)
+  #include <MatterHumidity.h>
+  #define HAS_MATTER_HUMI 1
+#endif
+#if __has_include(<MatterPressure.h>)
+  #include <MatterPressure.h>
+  #define HAS_MATTER_PRES 1
+#endif
+#if __has_include(<MatterAirQuality.h>)
+  #include <MatterAirQuality.h>
+  #define HAS_MATTER_AIRQ 1
+#endif
+
+#ifndef BTN_BUILTIN
+  #define BTN_BUILTIN 7
+#endif
+
+// ---------- Pins / I2C ----------
+const uint8_t DS18B20_PIN   = 5;     // D5 on Nano Matter
+const uint8_t OLED_I2C_ADDR = 0x3C;
+
+// ---------- Alert LED (single red or fallback to built-in) ----------
+#if defined(LED_RED)
+  #define ALERT_LED_PIN LED_RED
+#else
+  #define ALERT_LED_PIN LED_BUILTIN
+#endif
+
+// If your LED is active LOW, set this to 0
+#ifndef ALERT_LED_ACTIVE_HIGH
+  #define ALERT_LED_ACTIVE_HIGH 1
+#endif
+
+// ---------- Display ----------
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+
+// ---------- Sensors ----------
+ScioSense_ENS160 ens160(ENS160_I2CADDR_1); // 0x53
+Adafruit_BME680  bme;                      // 0x76/0x77
+OneWire          oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
+
+// ---------- Matter endpoints ----------
+#ifdef HAS_MATTER_TEMP
+  MatterTemperature matter_temp;
+#endif
+#ifdef HAS_MATTER_HUMI
+  MatterHumidity    matter_humi;
+#endif
+#ifdef HAS_MATTER_PRES
+  MatterPressure    matter_pres;
+#endif
+#ifdef HAS_MATTER_AIRQ
+  MatterAirQuality  matter_airq;
+#endif
+
+// ---------- Safe ranges for alerts ----------
+const float SAFE_CO2_MAX   = 1000.0f; // ppm
+const float SAFE_TVOC_MAX  = 500.0f;  // ppb
+const float SAFE_H_MIN     = 30.0f;   // %
+const float SAFE_H_MAX     = 70.0f;   // %
+const float SAFE_T_MIN     = 18.0f;   // C
+const float SAFE_T_MAX     = 25.0f;   // C
+const float SAFE_P_MIN     = 950.0f;  // hPa
+const float SAFE_P_MAX     = 1050.0f; // hPa
+
+// ---------- UI state ----------
+enum ScreenMode { SCREEN_WELCOME, SCREEN_SENSORS, SCREEN_PAIRING };
+ScreenMode screen = SCREEN_WELCOME;
+
+uint32_t welcome_until_ms = 0;
+uint32_t pairing_until_ms = 0;
+
+bool pairedCached = false;
+bool threadConnCached = false;
+
+uint32_t lastSensorMs = 0;
+
+// Display brightness presets
+static inline void setNormalBrightness()  { oled.setContrast(180); } // ~70%
+static inline void setPairingBrightness() { oled.setContrast(92); }  // ~36%
+
+// Sensor cache (OLED order includes AQI first)
+float   eco2_ppm  = NAN;   // ENS160
+float   tvoc_ppb  = NAN;   // ENS160
+float   humi_pct  = NAN;   // BME680
+float   pres_hpa  = NAN;   // BME680
+float   tempC_ds  = NAN;   // DS18B20
+uint8_t aqi_value = 0;     // 1..5 (derived)
+
+// keep last known non-zero for ENS160
+float lastEco2 = NAN, lastTvoc = NAN;
+
+// Button
+bool     btnLast      = true;
+uint32_t btnDownMs    = 0;
+
+// Pairing data
+String pairingPIN;       // manual 11-digit code
+String pairingPayload;   // MT:... QR payload
+
+// ---------- Forward declarations ----------
+void drawLeftLine(int y, const char* text, const uint8_t* font);
+void drawCenteredH(int y, const char* text, const uint8_t* font);
+void drawCenteredInRightPanel(int xRight, int wRight, int y, const char* text, const uint8_t* font);
+void drawWelcome();
+String extractQrPayload();
+void drawMaxQRIn64Frame_Left(const String& data, const int marginPx = 1);
+void drawPairing();
+void drawSensors();
+uint8_t computeAirQualityIndex(float eco2_ppm_in, float tvoc_ppb_in);
+void readSensors();
+void matterPublish();
+void handleButton();
+void updateAlertLed(uint32_t ms);
+
+// ---------- Text helpers ----------
+void drawLeftLine(int y, const char* text, const uint8_t* font) {
+  oled.setFont(font);
+  oled.setCursor(0, y);
+  oled.print(text);
+}
+void drawCenteredH(int y, const char* text, const uint8_t* font) {
+  oled.setFont(font);
+  int w = oled.getUTF8Width(text);
+  int x = (128 - w) / 2;
+  if (x < 0) x = 0;
+  oled.setCursor(x, y);
+  oled.print(text);
+}
+void drawCenteredInRightPanel(int xRight, int wRight, int y, const char* text, const uint8_t* font) {
+  oled.setFont(font);
+  int w = oled.getUTF8Width(text);
+  int x = xRight + (wRight - w)/2;
+  if (x < xRight) x = xRight;
+  oled.setCursor(x, y);
+  oled.print(text);
+}
+
+// ---------- Welcome screen (centered with one blank line) ----------
+void drawWelcome() {
+  oled.clearBuffer();
+  setNormalBrightness();
+
+  const uint8_t* f = u8g2_font_6x12_tf;
+  oled.setFont(f);
+  int asc = oled.getAscent();
+  int dsc = -oled.getDescent();
+  int lh  = asc + dsc;
+
+  int total = 4 * lh;                 // "Arduino" + "Nano Matter AQI" + blank + "ENS160+BME680+DS18B20"
+  int top   = (64 - total) / 2 + asc;
+
+  int y1 = top;
+  int y2 = y1 + lh;
+  int y4 = y2 + 2*lh;                 // blank line between
+
+  drawCenteredH(y1, "Arduino", f);
+  drawCenteredH(y2, "Nano Matter AQI", f);
+  drawCenteredH(y4, "ENS160+BME680+DS18B20", f);
+
+  oled.sendBuffer();
+}
+
+// ---------- Extract "MT:..." payload from Matter URL ----------
+String extractQrPayload() {
+  String url = Matter.getOnboardingQRCodeUrl();
+  int di = url.indexOf("data=");
+  if (di < 0) return String();
+  String enc = url.substring(di + 5);
+  int amp = enc.indexOf('&');
+  if (amp >= 0) enc = enc.substring(0, amp);
+
+  String out; out.reserve(enc.length());
+  for (size_t i = 0; i < enc.length(); ++i) {
+    char c = enc[i];
+    if (c == '+') out += ' ';
+    else if (c == '%' && i + 2 < enc.length()) {
+      auto hx = [](char h)->int{ if(h>='0'&&h<='9')return h-'0'; if(h>='A'&&h<='F')return 10+(h-'A'); if(h>='a'&&h<='f')return 10+(h-'a'); return 0; };
+      char v = (char)((hx(enc[i+1])<<4) | hx(enc[i+2]));
+      out += v; i += 2;
+    } else out += c;
+  }
+  if (!out.startsWith("MT:")) return String();
+  return out;
+}
+
+/* Pixel-accurate QR inside 64x64 frame @ (0,0), with EXACT 1-px pad. */
+void drawMaxQRIn64Frame_Left(const String& data, const int marginPx) {
+  const int frameX = 0, frameY = 0, box = 64;
+  oled.drawFrame(frameX, frameY, box, box);
+  if (data.length() == 0) return;
+
+  uint8_t qrbuff[qrcode_getBufferSize(10)];
+  QRCode  qr; bool ok = false;
+  for (uint8_t ver = 1; ver <= 10; ++ver) {
+    if (qrcode_initText(&qr, qrbuff, ver, ECC_LOW, data.c_str()) == 0) { ok = true; break; }
+  }
+  if (!ok) qrcode_initText(&qr, qrbuff, 10, ECC_LOW, data.c_str());
+
+  const int size  = qr.size;
+  const int avail = box - 2*marginPx;
+  if (avail <= 0 || size <= 0) return;
+
+  const int base  = avail / size;
+  const int extra = avail % size;
+
+  const int ox = frameX + marginPx;
+  const int oy = frameY + marginPx;
+
+  static uint16_t xEdge[182], yEdge[182];
+  uint16_t sum = 0;
+  for (int i = 0; i < size; ++i) { sum += base + (i < extra ? 1 : 0); xEdge[i+1] = sum; }
+  sum = 0;
+  for (int i = 0; i < size; ++i) { sum += base + (i < extra ? 1 : 0); yEdge[i+1] = sum; }
+
+  oled.setDrawColor(1);
+  for (int y = 0; y < size; y++) {
+    const int py = oy + yEdge[y];
+    const int h  = (int)yEdge[y+1] - (int)yEdge[y];
+    for (int x = 0; x < size; x++) {
+      if (qrcode_getModule(&qr, x, y)) {
+        const int px = ox + xEdge[x];
+        const int w  = (int)xEdge[x+1] - (int)xEdge[x];
+        oled.drawBox(px, py, w, h);
+      }
+    }
+  }
+}
+
+// ---------- Pairing screen ----------
+void drawPairing() {
+  oled.clearBuffer();
+  setPairingBrightness();
+
+  drawMaxQRIn64Frame_Left(pairingPayload, 1);
+
+  const int xRight  = 64 + 8;
+  const int wRight  = 128 - xRight;
+
+  // Code “123 456” / “789 01”  (strip spaces/hyphens first)
+  String d = pairingPIN; d.replace(" ", ""); d.replace("-", "");
+  String top6    = (d.length() >= 6 ) ? (d.substring(0,3) + " " + d.substring(3,6)) : d;
+  String bottom5 = (d.length() >= 11) ? (d.substring(6,9) + " " + d.substring(9,11))
+                                      : (d.length()>6? d.substring(6) : "");
+
+  // Fonts
+  oled.setFont(u8g2_font_6x12_tf);
+  const int ascBig   = oled.getAscent();
+  const int descBig  = -oled.getDescent();
+  const int lineHBig = ascBig + descBig;
+
+  oled.setFont(u8g2_font_5x8_mf);
+  const int ascSm    = oled.getAscent();
+  const int descSm   = -oled.getDescent();
+  const int lineHSm  = ascSm + descSm;
+
+  // Status text (two lines while not commissioned; also split "Thread: connected")
+  bool twoLineStatus = false;
+  const char* s1 = nullptr;
+  const char* s2 = nullptr;
+  if (!Matter.isDeviceCommissioned()) {
+    s1 = "Waiting for";
+    s2 = "pairing...";
+    twoLineStatus = true;
+  } else if (!Matter.isDeviceThreadConnected()) {
+    s1 = "Thread: connecting";
+    twoLineStatus = false;
+  } else {
+    // Connected -> split across two lines to fit nicely
+    s1 = "Thread:";
+    s2 = "connected";
+    twoLineStatus = true;
+  }
+
+  // Vertical center in right panel
+  const int blockH = 2*lineHBig + lineHBig + (twoLineStatus ? 2*lineHSm : lineHSm);
+  const int topY   = (64 - blockH) / 2;
+
+  // Codes
+  const int yCode1 = topY + ascBig;
+  const int yCode2 = topY + lineHBig + ascBig;
+  drawCenteredInRightPanel(xRight, wRight, yCode1, top6.c_str(),    u8g2_font_6x12_tf);
+  drawCenteredInRightPanel(xRight, wRight, yCode2, bottom5.c_str(), u8g2_font_6x12_tf);
+
+  // blank (lineHBig)
+  const int yStatusStart = topY + 2*lineHBig + lineHBig;
+
+  // Status (small)
+  const int yS1 = yStatusStart + ascSm;
+  drawCenteredInRightPanel(xRight, wRight, yS1, s1, u8g2_font_5x8_mf);
+  if (twoLineStatus && s2) {
+    const int yS2 = yS1 + (ascSm + descSm);
+    drawCenteredInRightPanel(xRight, wRight, yS2, s2, u8g2_font_5x8_mf);
+  }
+
+  oled.sendBuffer();
+}
+
+// ---------- Sensor screen (AQI, eCO2, tVOC, Humidity, Pressure, Temperature) ----------
+void drawSensors() {
+  oled.clearBuffer();
+  setNormalBrightness();
+
+  // Use 6x10 so 6 lines fit (60 px)
+  const uint8_t* f = u8g2_font_6x10_tf;
+  oled.setFont(f);
+  int asc = oled.getAscent();
+  int dsc = -oled.getDescent();
+  int lh  = asc + dsc;
+
+  int y1 = asc;          // AQI
+  int y2 = y1 + lh;      // eCO2
+  int y3 = y2 + lh;      // tVOC
+  int y4 = y3 + lh;      // Humidity
+  int y5 = y4 + lh;      // Pressure
+  int y6 = y5 + lh;      // Temperature
+
+  char line[48];
+
+  // 0) AQI (1..5)
+  if (aqi_value < 1 || aqi_value > 5) snprintf(line, sizeof(line), "AQI: -");
+  else                                 snprintf(line, sizeof(line), "AQI: %u", (unsigned)aqi_value);
+  drawLeftLine(y1, line, f);
+
+  // 1) eCO2
+  if (isnan(eco2_ppm)) snprintf(line, sizeof(line), "eCO2: ---- ppm");
+  else                 snprintf(line, sizeof(line), "eCO2: %.0f ppm", roundf(eco2_ppm));
+  drawLeftLine(y2, line, f);
+
+  // 2) tVOC
+  if (isnan(tvoc_ppb)) snprintf(line, sizeof(line), "tVOC: ---- ppb");
+  else                 snprintf(line, sizeof(line), "tVOC: %.0f ppb", roundf(tvoc_ppb));
+  drawLeftLine(y3, line, f);
+
+  // 3) Humidity
+  if (isnan(humi_pct)) snprintf(line, sizeof(line), "Humidity: -- %%");
+  else                 snprintf(line, sizeof(line), "Humidity: %.0f %%", roundf(humi_pct));
+  drawLeftLine(y4, line, f);
+
+  // 4) Pressure
+  if (isnan(pres_hpa)) snprintf(line, sizeof(line), "Pressure: ---- hPa");
+  else                 snprintf(line, sizeof(line), "Pressure: %.0f hPa", roundf(pres_hpa));
+  drawLeftLine(y5, line, f);
+
+  // 5) Temperature
+  if (isnan(tempC_ds)) snprintf(line, sizeof(line), "Temperature: --.- \xC2\xB0""C");
+  else                 snprintf(line, sizeof(line), "Temperature: %.1f \xC2\xB0""C", tempC_ds);
+  drawLeftLine(y6, line, f);
+
+  oled.sendBuffer();
+}
+
+// ---------- Compute Air Quality enum (1..5) from eCO2 + tVOC ----------
+uint8_t computeAirQualityIndex(float eco2_ppm_in, float tvoc_ppb_in) {
+  auto clamp15 = [](int v){ if(v<1) return 1; if(v>5) return 5; return v; };
+
+  int idx_voc;
+  if (isnan(tvoc_ppb_in)) idx_voc = 3;
+  else if (tvoc_ppb_in < 150) idx_voc = 1;
+  else if (tvoc_ppb_in < 300) idx_voc = 2;
+  else if (tvoc_ppb_in < 450) idx_voc = 3;
+  else if (tvoc_ppb_in < 600) idx_voc = 4;
+  else idx_voc = 5;
+
+  int idx_co2;
+  if (isnan(eco2_ppm_in)) idx_co2 = 3;
+  else if (eco2_ppm_in < 600) idx_co2 = 1;
+  else if (eco2_ppm_in < 1000) idx_co2 = 2;
+  else if (eco2_ppm_in < 1500) idx_co2 = 3;
+  else if (eco2_ppm_in < 2000) idx_co2 = 4;
+  else idx_co2 = 5;
+
+  int worse = (idx_voc >= idx_co2) ? idx_voc : idx_co2;
+  return (uint8_t)clamp15(worse);
+}
+
+// ---------- Sensor reading ----------
+void readSensors() {
+  // DS18B20
+  ds18b20.requestTemperatures();
+  float t = ds18b20.getTempCByIndex(0);
+  if (t > -100 && t < 100) tempC_ds = t;
+
+  // BME680
+  if (bme.performReading()) {
+    humi_pct = bme.humidity;            // %
+    pres_hpa = bme.pressure / 100.0f;   // hPa
+  }
+
+  // ENS160 (avoid transient zeros)
+  ens160.measure(0);
+  float tv = ens160.getTVOC();
+  float co = ens160.geteCO2();
+  if (tv > 0)  { tvoc_ppb = tv; lastTvoc = tv; }
+  else if (!isnan(lastTvoc)) tvoc_ppb = lastTvoc;
+
+  if (co > 0)  { eco2_ppm = co; lastEco2 = co; }
+  else if (!isnan(lastEco2)) eco2_ppm = lastEco2;
+
+  // AQI
+  aqi_value = computeAirQualityIndex(eco2_ppm, tvoc_ppb);
+
+  // Serial in order (AQI first)
+  Serial.println(F("--- Sensor readings ---"));
+  Serial.print(F("AQI (derived):        ")); Serial.println(aqi_value);
+  Serial.print(F("eCO2 (ENS160):        ")); if (isnan(eco2_ppm)) Serial.println(F("---- ppm")); else { Serial.print(eco2_ppm,0); Serial.println(F(" ppm")); }
+  Serial.print(F("tVOC (ENS160):        ")); if (isnan(tvoc_ppb)) Serial.println(F("---- ppb")); else { Serial.print(tvoc_ppb,0); Serial.println(F(" ppb")); }
+  Serial.print(F("Humidity (BME680):    ")); if (isnan(humi_pct)) Serial.println(F("-- %"));  else { Serial.print(humi_pct,0);  Serial.println(F(" %"));  }
+  Serial.print(F("Pressure (BME680):    ")); if (isnan(pres_hpa)) Serial.println(F("---- hPa")); else { Serial.print(pres_hpa,0); Serial.println(F(" hPa")); }
+  Serial.print(F("Temperature (DS18B20): ")); if (isnan(tempC_ds)) Serial.println(F("--.- C")); else { Serial.print(tempC_ds,1); Serial.println(F(" C")); }
+#ifdef HAS_MATTER_AIRQ
+  Serial.print(F("Air Quality (Matter): ")); Serial.println(aqi_value);
+#endif
+}
+
+// ---------- Matter publish (Temp/Hum/Pres) + Air Quality enum ----------
+void matterPublish() {
+#ifdef HAS_MATTER_HUMI
+  if (!isnan(humi_pct)) matter_humi.set_measured_value(humi_pct);    // %
+#endif
+#ifdef HAS_MATTER_PRES
+  if (!isnan(pres_hpa)) matter_pres.set_measured_value(pres_hpa);    // hPa
+#endif
+#ifdef HAS_MATTER_TEMP
+  if (!isnan(tempC_ds)) matter_temp.set_measured_value_celsius(tempC_ds); // C
+#endif
+#ifdef HAS_MATTER_AIRQ
+  matter_airq.set_air_quality(static_cast<MatterAirQuality::AirQuality_t>(aqi_value)); // 1..5
+#endif
+}
+
+// ---------- Red alert LED (blink when any out of safe range) ----------
+void setAlertLed(bool on) {
+#if ALERT_LED_ACTIVE_HIGH
+  digitalWrite(ALERT_LED_PIN, on ? HIGH : LOW);
+#else
+  digitalWrite(ALERT_LED_PIN, on ? LOW : HIGH);
+#endif
+}
+
+void updateAlertLed(uint32_t ms) {
+  bool eco2_bad = (!isnan(eco2_ppm) && eco2_ppm > SAFE_CO2_MAX);
+  bool tvoc_bad = (!isnan(tvoc_ppb) && tvoc_ppb > SAFE_TVOC_MAX);
+  bool hum_bad  = (!isnan(humi_pct) && (humi_pct < SAFE_H_MIN || humi_pct > SAFE_H_MAX));
+  bool tmp_bad  = (!isnan(tempC_ds) && (tempC_ds < SAFE_T_MIN || tempC_ds > SAFE_T_MAX));
+  bool prs_bad  = (!isnan(pres_hpa) && (pres_hpa < SAFE_P_MIN || pres_hpa > SAFE_P_MAX));
+
+  bool any = eco2_bad || tvoc_bad || hum_bad || tmp_bad || prs_bad;
+
+  if (!any) {
+    setAlertLed(false);          // LED off when all OK
+    return;
+  }
+
+  // Blink 2 Hz when any value is out of range
+  bool phase = ((ms / 250) % 2) == 0;
+  setAlertLed(phase);
+}
+
+// ---------- Button handling ----------
+void handleButton() {
+  bool now = (digitalRead(BTN_BUILTIN) == LOW); // active LOW
+  uint32_t ms = millis();
+
+  if (now && !btnLast) {
+    btnDownMs = ms;
+  } else if (!now && btnLast) {
+    uint32_t held = ms - btnDownMs;
+    if (held >= 6000) {
+      Serial.println(F("Decommissioning..."));
+      oled.clearBuffer();
+      drawCenteredH(32, "Decommissioning...", u8g2_font_6x12_tf);
+      oled.sendBuffer();
+      delay(200);
+      Matter.decommission(); // device reboots after
+    } else {
+      pairing_until_ms = ms + 30000ul;
+      screen = SCREEN_PAIRING;
+      drawPairing(); // one-shot render (no flicker)
+    }
+  }
+  btnLast = now;
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+  delay(20);
+  Serial.println();
+  Serial.println(F("Arduino Nano Matter AQI starting..."));
+
+  pinMode(BTN_BUILTIN, INPUT_PULLUP);
+  pinMode(ALERT_LED_PIN, OUTPUT);
+#if !ALERT_LED_ACTIVE_HIGH
+  digitalWrite(ALERT_LED_PIN, HIGH); // off
+#else
+  digitalWrite(ALERT_LED_PIN, LOW);  // off
+#endif
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  oled.begin();
+  oled.setI2CAddress(OLED_I2C_ADDR << 1);
+  oled.enableUTF8Print();                 // correct "°"
+  setNormalBrightness();
+  drawWelcome();
+  welcome_until_ms = millis() + 3000;
+
+  // Sensors
+  if (!bme.begin(0x76) && !bme.begin(0x77)) {
+    Serial.println(F("ERROR: BME680 not found at 0x76/0x77!"));
+  } else {
+    bme.setTemperatureOversampling(BME680_OS_2X);
+    bme.setHumidityOversampling(BME680_OS_4X);
+    bme.setPressureOversampling(BME680_OS_4X);
+    bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+    bme.setGasHeater(0, 0); // gas off
+    Serial.println(F("BME680 OK"));
+  }
+
+  ds18b20.begin();
+  Serial.println(F("DS18B20 OK"));
+
+  if (!ens160.begin()) {
+    Serial.println(F("ERROR: ENS160 not found!"));
+  } else {
+    ens160.setMode(ENS160_OPMODE_STD);
+    Serial.println(F("ENS160 OK (warm-up)"));
+    delay(3000);
+  }
+
+  // Matter
+  Matter.begin();
+
+#ifdef HAS_MATTER_TEMP
+  matter_temp.begin();
+#else
+  Serial.println(F("[Matter] Temperature cluster not found in this library build."));
+#endif
+#ifdef HAS_MATTER_HUMI
+  matter_humi.begin();
+#else
+  Serial.println(F("[Matter] Humidity cluster not found in this library build."));
+#endif
+#ifdef HAS_MATTER_PRES
+  matter_pres.begin();
+  Serial.println(F("[Matter] Pressure cluster enabled."));
+#else
+  Serial.println(F("[Matter] Pressure cluster NOT available in this library build."));
+#endif
+#ifdef HAS_MATTER_AIRQ
+  matter_airq.begin();
+  Serial.println(F("[Matter] Air Quality cluster enabled (enum)."));
+#else
+  Serial.println(F("[Matter] Air Quality cluster NOT available in this library build."));
+#endif
+
+  pairingPIN     = Matter.getManualPairingCode();
+  pairingPayload = extractQrPayload();
+
+  if (!Matter.isDeviceCommissioned()) {
+    Serial.println(F("Matter device is NOT commissioned."));
+    Serial.print(F("Manual pairing code: "));
+    Serial.println(pairingPIN);
+  }
+
+  screen = SCREEN_WELCOME;
+}
+
+// ---------- Loop ----------
+void loop() {
+  handleButton();
+
+  uint32_t ms = millis();
+
+  if (screen == SCREEN_WELCOME && ms >= welcome_until_ms) {
+    screen = SCREEN_SENSORS;
+    readSensors();
+    drawSensors();
+  }
+
+  if (screen == SCREEN_PAIRING && ms >= pairing_until_ms) {
+    screen = SCREEN_SENSORS;
+    setNormalBrightness();
+    drawSensors();
+  }
+
+  // Only redraw pairing screen if commissioning state changes (no flicker)
+  bool nowPaired = Matter.isDeviceCommissioned();
+  bool nowThread = Matter.isDeviceThreadConnected();
+  if ((nowPaired != pairedCached || nowThread != threadConnCached) && screen == SCREEN_PAIRING) {
+    pairedCached = nowPaired; threadConnCached = nowThread;
+    drawPairing();
+  } else {
+    pairedCached = nowPaired; threadConnCached = nowThread;
+  }
+
+  // Periodic sensor updates + publish
+  if (screen == SCREEN_SENSORS && (ms - lastSensorMs >= 2000)) {
+    lastSensorMs = ms;
+    readSensors();
+    matterPublish();
+    drawSensors();
+  }
+
+  // Red alert LED every loop
+  updateAlertLed(ms);
+}
